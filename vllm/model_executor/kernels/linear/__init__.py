@@ -11,6 +11,12 @@ minimize the need to update imports across other modules when the
 internal structure changes. If you are adding a new kernel selector
 or kernel implementation, add it to this __init__.py to maintain
 import stability.
+
+OOT Plugin Support:
+    This module supports OOT (Out-Of-Tree) hardware plugins. OOT vendors can
+    register their custom kernel implementations by calling register_linear_kernel()
+    from vllm.model_executor.kernels.linear.oot_plugin, or by setting the
+    VLLM_OOT_PLUGIN_PATH environment variable to point to their plugin directory.
 """
 
 import os
@@ -23,6 +29,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.mixed_precision import (
     MPLinearKernel,
     MPLinearLayerConfig,
+)
+
+# Import OOT plugin system
+from vllm.model_executor.kernels.linear.oot_plugin import (
+    get_oot_fp8_kernels,
+    get_oot_int8_kernels,
+    get_oot_mp_kernels,
 )
 from vllm.model_executor.kernels.linear.mixed_precision.allspark import (
     AllSparkLinearKernel,
@@ -177,11 +190,31 @@ def is_supported_and_can_implement_kernel(
     return True, ""
 
 
+def _get_oot_scaled_mm_kernels(
+    kernel_type: str,
+) -> list[type[ScaledMMLinearKernel]]:
+    """
+    Get OOT kernels for scaled_mm operations.
+    
+    Args:
+        kernel_type: "fp8" or "int8"
+    
+    Returns:
+        List of OOT kernel classes
+    """
+    if kernel_type == "fp8":
+        return get_oot_fp8_kernels(current_platform._enum)
+    elif kernel_type == "int8":
+        return get_oot_int8_kernels(current_platform._enum)
+    return []
+
+
 def choose_scaled_mm_linear_kernel(
     config: _KernelConfigT,
     possible_kernels: dict[PlatformEnum, list[type[_KernelT]]],
     compute_capability: int | None = None,
     force_kernel: type[_KernelT] | None = None,
+    kernel_type: str = "fp8",
 ) -> type[_KernelT]:
     """
     Choose a _KernelT that can implement the given config for the
@@ -199,6 +232,7 @@ def choose_scaled_mm_linear_kernel(
         force_kernel (Optional[type[_KernelT]]): An Optional forced kernel to override
             the possible_kernels if it can be implemented. If None, it will only try the
             possible kernels.
+        kernel_type (str): Type of kernel ("fp8" or "int8") for OOT plugin lookup
 
     Raises:
         ValueError: If no kernel can implement the given config.
@@ -222,6 +256,7 @@ def choose_scaled_mm_linear_kernel(
             scope="global",
         )
 
+    # Try built-in kernels first
     for kernel in possible_kernels[current_platform._enum]:
         is_supported_and_can_implement, failure_reason = (
             is_supported_and_can_implement_kernel(kernel, config, compute_capability)
@@ -229,6 +264,17 @@ def choose_scaled_mm_linear_kernel(
         if is_supported_and_can_implement:
             return kernel
         failure_reason_list.append(failure_reason)
+    
+    # Try OOT kernels
+    oot_kernels = _get_oot_scaled_mm_kernels(kernel_type)
+    for kernel in oot_kernels:
+        is_supported_and_can_implement, failure_reason = (
+            is_supported_and_can_implement_kernel(kernel, config, compute_capability)
+        )
+        if is_supported_and_can_implement:
+            logger.info("Selected OOT kernel %s", kernel.__name__)
+            return kernel
+        failure_reason_list.append(f"[OOT] {failure_reason}")
 
     raise ValueError(
         "Failed to find a kernel that can implement the "
@@ -250,7 +296,10 @@ def init_fp8_linear_kernel(
     )
 
     kernel_type = choose_scaled_mm_linear_kernel(
-        scaled_mm_linear_kernel_config, _POSSIBLE_FP8_KERNELS, force_kernel=force_kernel
+        scaled_mm_linear_kernel_config,
+        _POSSIBLE_FP8_KERNELS,
+        force_kernel=force_kernel,
+        kernel_type="fp8",
     )
 
     if module_name:
@@ -282,6 +331,7 @@ def init_int8_linear_kernel(
     kernel_type = choose_scaled_mm_linear_kernel(
         config,
         _POSSIBLE_INT8_KERNELS,
+        kernel_type="int8",
     )
 
     logger.info_once(
@@ -301,6 +351,36 @@ def init_int8_linear_kernel(
             "azp_adj",
         ],
     )
+
+
+def _get_all_mp_kernels() -> dict[PlatformEnum, list[type[MPLinearKernel]]]:
+    """
+    Get all available MP kernels including OOT plugins.
+    
+    Returns:
+        Dictionary mapping platforms to their kernel lists
+    """
+    # Start with built-in kernels
+    all_kernels = {}
+    
+    for platform, kernels in _POSSIBLE_KERNELS.items():
+        all_kernels[platform] = list(kernels)
+    
+    # Add OOT plugin kernels after built-in kernels for current platform
+    platform_enum = current_platform._enum
+    oot_kernels = get_oot_mp_kernels(platform_enum)
+    if oot_kernels:
+        if platform_enum not in all_kernels:
+            all_kernels[platform_enum] = []
+        
+        # Add OOT kernels after built-in kernels
+        for oot_kernel in oot_kernels:
+            if oot_kernel not in all_kernels[platform_enum]:
+                all_kernels[platform_enum].append(oot_kernel)
+                logger.info("Added OOT kernel %s to platform %s",
+                           oot_kernel.__name__, platform_enum.name)
+    
+    return all_kernels
 
 
 def choose_mp_linear_kernel(
@@ -331,8 +411,27 @@ def choose_mp_linear_kernel(
         if _cc is not None:
             compute_capability = _cc[0] * 10 + _cc[1]
 
+    # Get all kernels including OOT plugins
+    all_kernels = _get_all_mp_kernels()
+    kernels_to_try = all_kernels.get(current_platform._enum, [])
+    
+    # Also try OOT kernels from other platforms (in case of cross-platform support)
+    for platform, platform_kernels in all_kernels.items():
+        if platform != current_platform._enum:
+            for kernel in platform_kernels:
+                if kernel not in kernels_to_try:
+                    # Check if this kernel supports the current platform
+                    can_support, _ = kernel.can_implement(config)
+                    if can_support:
+                        kernels_to_try.append(kernel)
+                        logger.info(
+                            "OOT kernel %s from %s supports current platform %s, "
+                            "adding to kernel candidates",
+                            kernel.__name__, platform.name, current_platform._enum.name
+                        )
+
     failure_reasons = []
-    for kernel in _POSSIBLE_KERNELS[current_platform._enum]:
+    for kernel in kernels_to_try:
         if kernel.__name__ in envs.VLLM_DISABLED_KERNELS:
             failure_reasons.append(
                 f" {kernel.__name__} disabled by environment variable"
@@ -364,15 +463,23 @@ def choose_mp_linear_kernel(
 
 
 __all__ = [
+    # Kernel initialization functions
     "init_fp8_linear_kernel",
     "init_int8_linear_kernel",
     "choose_mp_linear_kernel",
+    # OOT Plugin functions
+    "register_linear_kernel",
+    "get_oot_mp_kernels",
+    "get_oot_fp8_kernels",
+    "get_oot_int8_kernels",
+    # Base kernel classes
     "FP8ScaledMMLinearKernel",
     "Int8ScaledMMLinearKernel",
     "ScaledMMLinearKernel",
     "FP8ScaledMMLinearLayerConfig",
     "Int8ScaledMMLinearLayerConfig",
     "ScaledMMLinearLayerConfig",
+    # MP Kernel implementations
     "AiterInt8ScaledMMLinearKernel",
     "CPUInt8ScaledMMLinearKernel",
     "CutlassFP8ScaledMMLinearKernel",
